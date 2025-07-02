@@ -7,7 +7,7 @@ This script tests different prompt compression methods by:
 2. Generating compressed versions using various strategies
 3. Computing embeddings for original and compressed versions
 4. Measuring semantic similarity between them
-5. Evaluating compression effectiveness (both character and token-based)
+5. Evaluating compression effectiveness
 """
 
 import sqlite3
@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tempfile
 import os
-import re
 
 @dataclass
 class TestCase:
@@ -43,57 +42,14 @@ class CompressionResult:
     original_length: int
     compressed_length: int
     compression_ratio: float
-    original_tokens: int
-    compressed_tokens: int
-    token_compression_ratio: float
     original_embedding: List[float]
     compressed_embedding: List[float]
     similarity_score: float
 
-class TokenCounter:
-    """Simple token counter using various estimation methods."""
-    
-    @staticmethod
-    def estimate_tokens_simple(text: str) -> int:
-        """Simple token estimation: ~4 characters per token for English text."""
-        return len(text) // 4
-    
-    @staticmethod
-    def estimate_tokens_whitespace(text: str) -> int:
-        """Whitespace-based token estimation."""
-        tokens = re.findall(r'\b\w+\b|[^\w\s]', text)
-        return len(tokens)
-    
-    @staticmethod  
-    def estimate_tokens_word_based(text: str) -> int:
-        """Word-based estimation with adjustments for common patterns."""
-        words = text.split()
-        
-        token_count = 0
-        for word in words:
-            # Long words often get split into multiple tokens
-            if len(word) > 12:
-                token_count += max(2, len(word) // 6)
-            elif len(word) > 8:
-                token_count += 2
-            else:
-                token_count += 1
-                
-        # Add tokens for punctuation and special characters
-        punct_count = len(re.findall(r'[^\w\s]', text))
-        token_count += punct_count * 0.5  # Punctuation often shares tokens
-        
-        return int(token_count)
-    
-    @staticmethod
-    def get_best_estimate(text: str) -> int:
-        """Get the most accurate token estimate (word-based method)."""
-        return TokenCounter.estimate_tokens_word_based(text)
-
 class PromptCompressor:
     """Handles different prompt compression strategies using LLM."""
     
-    def __init__(self, model: str = "openrouter/google/gemini-2.5-flash-preview-05-20"):
+    def __init__(self, model: str = "claude-3.5-haiku"):
         self.model = model
         
     def compress_prompt(self, prompt: str, strategy: str) -> str:
@@ -130,16 +86,12 @@ class EmbeddingComparer:
         """Get embedding for text using llm CLI."""
         import json
         
-        # Use shell to pipe text to llm embed, suppress debug output
-        cmd = f'echo {json.dumps(text)} | llm embed -m {self.embedding_model} 2>/dev/null'
+        # Use shell to pipe text to llm embed
+        cmd = f'echo {json.dumps(text)} | llm embed -m {self.embedding_model}'
         result = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, check=True)
         
-        # Extract just the JSON array part (the last line should be the JSON)
-        output_lines = result.stdout.strip().split('\n')
-        json_line = output_lines[-1]  # The JSON array should be the last line
-        
         # Parse the JSON array output
-        embedding_data = json.loads(json_line)
+        embedding_data = json.loads(result.stdout.strip())
         return embedding_data
         
     def cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
@@ -206,11 +158,6 @@ async def run_compression_test(test_case: TestCase, strategy: str,
     compressed_len = len(compressed)
     compression_ratio = compressed_len / original_len if original_len > 0 else 0
     
-    # Calculate token metrics
-    original_tokens = TokenCounter.get_best_estimate(test_case.prompt)
-    compressed_tokens = TokenCounter.get_best_estimate(compressed)
-    token_compression_ratio = compressed_tokens / original_tokens if original_tokens > 0 else 0
-    
     return CompressionResult(
         original_prompt=test_case.prompt,
         compressed_prompt=compressed,
@@ -218,9 +165,6 @@ async def run_compression_test(test_case: TestCase, strategy: str,
         original_length=original_len,
         compressed_length=compressed_len,
         compression_ratio=compression_ratio,
-        original_tokens=original_tokens,
-        compressed_tokens=compressed_tokens,
-        token_compression_ratio=token_compression_ratio,
         original_embedding=original_embedding,
         compressed_embedding=compressed_embedding,
         similarity_score=similarity
@@ -235,9 +179,6 @@ def save_results(results: List[CompressionResult], output_file: str):
             'original_length': result.original_length,
             'compressed_length': result.compressed_length,
             'compression_ratio': result.compression_ratio,
-            'original_tokens': result.original_tokens,
-            'compressed_tokens': result.compressed_tokens,
-            'token_compression_ratio': result.token_compression_ratio,
             'similarity_score': result.similarity_score,
             'original_prompt': result.original_prompt,
             'compressed_prompt': result.compressed_prompt
@@ -259,7 +200,7 @@ def main():
                       help='Compression strategies to test')
     parser.add_argument('--output', default='compression_results.json',
                       help='Output file for results')
-    parser.add_argument('--model', default='openrouter/google/gemini-2.5-flash-preview-05-20',
+    parser.add_argument('--model', default='claude-3.5-haiku',
                       help='LLM model for compression')
     
     args = parser.parse_args()
@@ -278,14 +219,13 @@ def main():
     
     # Run tests for each combination
     for test_case in test_cases:
-        print(f"\nTesting case {test_case.id} (length: {test_case.prompt_length} chars, ~{TokenCounter.get_best_estimate(test_case.prompt)} tokens)")
+        print(f"\nTesting case {test_case.id} (length: {test_case.prompt_length})")
         for strategy in args.strategies:
             try:
                 result = asyncio.run(run_compression_test(
                     test_case, strategy, compressor, embedder))
                 all_results.append(result)
-                print(f"  {strategy}: {result.compression_ratio:.2f} char ratio, "
-                      f"{result.token_compression_ratio:.2f} token ratio, "
+                print(f"  {strategy}: {result.compression_ratio:.2f} ratio, "
                       f"{result.similarity_score:.3f} similarity")
             except Exception as e:
                 print(f"  Error with {strategy}: {e}")
@@ -299,10 +239,9 @@ def main():
     for strategy in args.strategies:
         strategy_results = [r for r in all_results if r.compression_strategy == strategy]
         if strategy_results:
-            avg_char_ratio = sum(r.compression_ratio for r in strategy_results) / len(strategy_results)
-            avg_token_ratio = sum(r.token_compression_ratio for r in strategy_results) / len(strategy_results)
+            avg_ratio = sum(r.compression_ratio for r in strategy_results) / len(strategy_results)
             avg_similarity = sum(r.similarity_score for r in strategy_results) / len(strategy_results)
-            print(f"  {strategy}: avg char ratio {avg_char_ratio:.2f}, avg token ratio {avg_token_ratio:.2f}, avg similarity {avg_similarity:.3f}")
+            print(f"  {strategy}: avg ratio {avg_ratio:.2f}, avg similarity {avg_similarity:.3f}")
 
 if __name__ == '__main__':
     main()
