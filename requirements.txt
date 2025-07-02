@@ -1,0 +1,8 @@
+# This project uses simonw's llm CLI tool
+# Install with: pip install llm
+# Then install jina embeddings: llm install llm-embed-jina
+
+# For development/testing
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
