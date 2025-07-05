@@ -3,34 +3,36 @@
 Quick test to verify the setup is working correctly.
 """
 
-import subprocess
+import llm
 import sys
 import os
 import sqlite3
 
-def test_llm_cli():
-    """Test if llm CLI is available."""
+def test_llm_api():
+    """Test if llm Python API is available."""
     try:
-        result = subprocess.run(['llm', '--version'], capture_output=True, text=True)
-        print(f"✓ LLM CLI available: {result.stdout.strip()}")
+        # Test getting a model - using an available model
+        model = llm.get_model("claude-3.7-sonnet")
+        print(f"✓ LLM Python API available: {model.model_id}")
         return True
-    except FileNotFoundError:
-        print("✗ LLM CLI not found")
+    except Exception as e:
+        print(f"✗ LLM Python API not available: {e}")
         return False
 
-def test_jina_embeddings():
-    """Test if jina embeddings are available."""
+def test_embeddings():
+    """Test if embeddings are available."""
     try:
-        result = subprocess.run(['sh', '-c', 'echo "test" | llm embed -m jina-v4'], 
-                              capture_output=True, text=True)
-        if result.returncode == 0:
-            print("✓ Jina embeddings working")
+        # Use an available embedding model
+        embedding_model = llm.get_embedding_model("text-embedding-3-small")
+        result = embedding_model.embed("test")
+        if result:
+            print("✓ Embeddings working")
             return True
         else:
-            print(f"✗ Jina embeddings error: {result.stderr}")
+            print("✗ Embeddings returned empty result")
             return False
     except Exception as e:
-        print(f"✗ Jina embeddings test failed: {e}")
+        print(f"✗ Embeddings test failed: {e}")
         return False
 
 def test_database_access():
@@ -74,10 +76,10 @@ def main():
     print("Testing prompt compression setup...\n")
     
     tests = [
-        test_llm_cli,
+        test_llm_api,
         test_database_access,
         test_sample_data,
-        test_jina_embeddings
+        test_embeddings
     ]
     
     results = []
