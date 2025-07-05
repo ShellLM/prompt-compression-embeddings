@@ -1,15 +1,21 @@
-def get_embedding(self, text: str) -> List[float]:
-    """Get embedding for text using llm CLI."""
-    import json
-    
-    # Use shell to pipe text to llm embed, suppress debug output
-    cmd = f'echo {json.dumps(text)} | llm embed -m {self.embedding_model} 2>/dev/null'
-    result = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, check=True)
-    
-    # Extract just the JSON array part (the last line should be the JSON)
-    output_lines = result.stdout.strip().split('\n')
-    json_line = output_lines[-1]  # The JSON array should be the last line
-    
-    # Parse the JSON array output
-    embedding_data = json.loads(json_line)
-    return embedding_data
+import llm
+import json
+from typing import List
+
+def get_embedding(text: str, embedding_model: str = "text-embedding-3-small") -> List[float]:
+    """Get embedding for text using llm Python API."""
+    try:
+        # Use the llm Python API directly
+        embedding_model_obj = llm.get_embedding_model(embedding_model)
+        embedding_data = embedding_model_obj.embed(text)
+        return embedding_data
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return []
+
+# Example usage
+if __name__ == "__main__":
+    test_text = "This is a test sentence for embedding."
+    result = get_embedding(test_text)
+    print(f"Embedding length: {len(result)}")
+    print(f"First 5 values: {result[:5]}")

@@ -10,12 +10,13 @@ This script improves upon the previous method by:
 """
 import sqlite3
 import json
-import subprocess
+import llm
 import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import random
+import re
 
 @dataclass
 class ExemplarCandidate:
@@ -33,7 +34,7 @@ class AssessedExemplar:
     assessment: Dict
 
 class ExemplarFinder:
-    def __init__(self, db_path: str, assessment_model: str = "gemini-flash"):
+    def __init__(self, db_path: str, assessment_model: str = "gpt-4o-mini"):
         self.db_path = Path(db_path).expanduser()
         self.assessment_model = assessment_model
 
@@ -49,10 +50,7 @@ class ExemplarFinder:
                 WHERE len BETWEEN ? AND ?
                 ORDER BY RANDOM() LIMIT ?
                 """
-                cursor = conn.execute(prompt_query, (min_length, max_length, limit // 2))
-                for row in cursor:
-                    candidates.append(ExemplarCandidate(id=row[0], source_field=row[1], text=row[2], text_length=row[3]))
-
+                
                 # Query for long responses
                 response_query = """
                 SELECT id, 'response', response, length(response) as len
@@ -60,131 +58,157 @@ class ExemplarFinder:
                 WHERE len BETWEEN ? AND ?
                 ORDER BY RANDOM() LIMIT ?
                 """
-                cursor = conn.execute(response_query, (min_length, max_length, limit // 2))
-                for row in cursor:
-                    candidates.append(ExemplarCandidate(id=row[0], source_field=row[1], text=row[2], text_length=row[3]))
-        except sqlite3.Error as e:
-            print(f"Database error: {e}")
+                
+                # Get candidates from both prompts and responses
+                for query, source_type in [(prompt_query, 'prompt'), (response_query, 'response')]:
+                    cursor = conn.execute(query, (min_length, max_length, limit // 2))
+                    for row in cursor:
+                        candidate = ExemplarCandidate(
+                            id=row[0],
+                            source_field=row[1],
+                            text=row[2],
+                            text_length=row[3]
+                        )
+                        candidates.append(candidate)
+                
+                return candidates
+                
+        except Exception as e:
+            print(f"Error accessing database: {e}")
             return []
 
-        print(f"Retrieved {len(candidates)} candidates from the database.")
-        return candidates
-
-    def assess_candidate(self, candidate: ExemplarCandidate) -> Optional[Dict]:
-        """Use an LLM to assess the quality of a text candidate."""
-        # Truncate text to avoid excessive token usage for assessment
-        text_snippet = candidate.text[:4000]
-
+    def assess_exemplar(self, candidate: ExemplarCandidate) -> Optional[Dict]:
+        """Assess the quality of an exemplar using LLM."""
+        
+        # Truncate very long texts for assessment
+        text_snippet = candidate.text[:2000] if len(candidate.text) > 2000 else candidate.text
+        
         assessment_prompt = f"""
-        Analyze the following text snippet to determine its suitability as a test case for a text compression algorithm.
-        Provide your assessment in a strict JSON format.
-
-        **Evaluation Criteria:**
-        1.  **Information Density (1-10):** How much meaningful, non-trivial information is packed into the text? (1=fluff, 10=very dense).
-        2.  **Structural Complexity (1-10):** Does the text have a clear structure (e.g., lists, code, hierarchies, logical sections)? (1=monolithic block, 10=highly structured).
-        3.  **Readability (1-10):** How easy is it for a human to understand the text? (1=incoherent, 10=very clear). This is important for judging decompression quality later.
-        4.  **Suitability for Compression (1-10):** Based on the above, how good is this text for testing compression? High suitability means it has redundant parts but also a critical core of information that must be preserved. (1=unsuitable, 10=ideal).
-        5.  **Category:** Classify the text into one of the following categories: `Code`, `Technical Documentation`, `Structured Data`, `Formal Prose`, `Instructional Content`, `Conversational`, `Other`.
-        6.  **Justification:** A brief, one-sentence explanation for your 'Suitability' score.
-
-        **JSON Output Format:**
-        {{
-            "information_density": <score>,
-            "structural_complexity": <score>,
-            "readability": <score>,
-            "suitability_for_compression": <score>,
-            "category": "<category_name>",
-            "justification": "<one_sentence_reason>"
-        }}
-
-        **Text Snippet to Analyze:**
+        Please analyze the following text snippet and provide a JSON assessment with these metrics:
+        
+        - information_density: Scale 1-10, how much meaningful information per word
+        - structural_complexity: Scale 1-10, how complex is the structure/format
+        - readability: Scale 1-10, how clear and well-written it is
+        - suitability_for_compression: Scale 1-10, how well it would compress while preserving meaning
+        - category: Choose from ["Technical Documentation", "Creative Writing", "Code", "Academic", "Business", "Conversational", "Other"]
+        - justification: Brief explanation of the scores
+        
+        Return ONLY a valid JSON object with these fields.
+        
         ---
         {text_snippet}
         ---
         """
 
         try:
-            result = subprocess.run(
-                ['llm', '-m', self.assessment_model, assessment_prompt],
-                capture_output=True, text=True, check=True, timeout=60
-            )
+            model_obj = llm.get_model(self.assessment_model)
+            response = model_obj.prompt(assessment_prompt.strip(), temperature=0.1)
+            result_text = response.text()
+            
             # Find and parse the JSON block from the model's output
-            json_match = re.search(r'\{.*\}', result.stdout, re.DOTALL)
+            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
             else:
                 print(f"Warning: Could not parse JSON from assessment for candidate {candidate.id}")
                 return None
-        except (subprocess.CalledProcessError, json.JSONDecodeError, subprocess.TimeoutExpired) as e:
-            print(f"Error assessing candidate {candidate.id}: {e}")
+                
+        except Exception as e:
+            print(f"Error assessing exemplar {candidate.id}: {e}")
             return None
 
-    def find_and_assess_exemplars(self, num_needed: int, min_length: int, max_length: int, min_suitability: float) -> List[AssessedExemplar]:
-        """The main orchestration function."""
-        # Fetch more candidates than needed to account for filtering
-        candidates = self.get_candidates(min_length, max_length, limit=num_needed * 3)
-        if not candidates:
-            return []
-
+    def find_high_quality_exemplars(self, min_length: int = 1000, max_length: int = 8000, 
+                                   candidate_limit: int = 100, quality_threshold: float = 6.0) -> List[AssessedExemplar]:
+        """Find high-quality exemplars for testing."""
+        
+        print(f"Finding exemplars with length {min_length}-{max_length} characters...")
+        candidates = self.get_candidates(min_length, max_length, candidate_limit)
+        print(f"Found {len(candidates)} candidates")
+        
         assessed_exemplars = []
+        
         for i, candidate in enumerate(candidates):
-            if len(assessed_exemplars) >= num_needed:
-                break
-            print(f"Assessing candidate {i+1}/{len(candidates)} (ID: {candidate.id}, Field: {candidate.source_field})...")
-            assessment = self.assess_candidate(candidate)
-            if assessment and assessment.get('suitability_for_compression', 0) >= min_suitability:
-                assessed_exemplars.append(AssessedExemplar(
-                    id=candidate.id,
-                    source_field=candidate.source_field,
-                    text=candidate.text,
-                    text_length=candidate.text_length,
-                    assessment=assessment
-                ))
-                print(f"  -> QUALIFIED! Suitability: {assessment['suitability_for_compression']}, Category: {assessment['category']}")
-            elif assessment:
-                print(f"  -> SKIPPED. Suitability: {assessment.get('suitability_for_compression', 'N/A')}")
-
-        # Sort by suitability and return the top N
-        assessed_exemplars.sort(key=lambda x: x.assessment['suitability_for_compression'], reverse=True)
-        return assessed_exemplars[:num_needed]
+            print(f"Assessing candidate {i+1}/{len(candidates)}: {candidate.id}")
+            
+            assessment = self.assess_exemplar(candidate)
+            if assessment:
+                # Calculate average quality score
+                quality_scores = [
+                    assessment.get('information_density', 0),
+                    assessment.get('structural_complexity', 0),
+                    assessment.get('readability', 0),
+                    assessment.get('suitability_for_compression', 0)
+                ]
+                avg_quality = sum(quality_scores) / len(quality_scores)
+                
+                if avg_quality >= quality_threshold:
+                    assessed_exemplar = AssessedExemplar(
+                        id=candidate.id,
+                        source_field=candidate.source_field,
+                        text=candidate.text,
+                        text_length=candidate.text_length,
+                        assessment=assessment
+                    )
+                    assessed_exemplars.append(assessed_exemplar)
+                    print(f"  ✓ Quality score: {avg_quality:.1f}")
+                else:
+                    print(f"  ✗ Quality score: {avg_quality:.1f} (below threshold)")
+            else:
+                print(f"  ✗ Assessment failed")
+        
+        # Sort by quality (using suitability_for_compression as primary metric)
+        assessed_exemplars.sort(key=lambda x: x.assessment.get('suitability_for_compression', 0), reverse=True)
+        
+        return assessed_exemplars
 
 def main():
-    parser = argparse.ArgumentParser(description="Find high-quality exemplars for compression testing.")
-    parser.add_argument('--db-path', default='~/.config/io.datasette.llm/logs.db', help='Path to LLM logs database')
-    parser.add_argument('--count', type=int, default=50, help='Number of high-quality exemplars to find')
-    parser.add_argument('--min-length', type=int, default=2000, help='Minimum character length of the text')
-    parser.add_argument('--max-length', type=int, default=15000, help='Maximum character length of the text')
-    parser.add_argument('--min-suitability', type=float, default=7.5, help='Minimum suitability score (1-10) to be considered a good exemplar')
-    parser.add_argument('--output', default='high_quality_exemplars.json', help='Output file for the found exemplars')
-    parser.add_argument('--model', default='gemini-flash', help='LLM model for assessment')
+    parser = argparse.ArgumentParser(description='Find high-quality exemplars for compression testing')
+    parser.add_argument('--db', default='~/.config/io.datasette.llm/logs.db', help='Database path')
+    parser.add_argument('--min-length', type=int, default=1000, help='Minimum text length')
+    parser.add_argument('--max-length', type=int, default=8000, help='Maximum text length')
+    parser.add_argument('--candidates', type=int, default=100, help='Number of candidates to assess')
+    parser.add_argument('--threshold', type=float, default=6.0, help='Quality threshold')
+    parser.add_argument('--output', default='high_quality_exemplars.json', help='Output file')
+    parser.add_argument('--model', default='gpt-4o-mini', help='Assessment model')
+    
     args = parser.parse_args()
-
-    finder = ExemplarFinder(db_path=args.db_path, assessment_model=args.model)
-    exemplars = finder.find_and_assess_exemplars(
-        num_needed=args.count,
+    
+    finder = ExemplarFinder(args.db, args.model)
+    exemplars = finder.find_high_quality_exemplars(
         min_length=args.min_length,
         max_length=args.max_length,
-        min_suitability=args.min_suitability
+        candidate_limit=args.candidates,
+        quality_threshold=args.threshold
     )
-
+    
+    # Convert to JSON-serializable format
+    output_data = []
+    for exemplar in exemplars:
+        output_data.append({
+            'id': exemplar.id,
+            'source_field': exemplar.source_field,
+            'text_length': exemplar.text_length,
+            'assessment': exemplar.assessment,
+            'text': exemplar.text
+        })
+    
+    # Save results
+    with open(args.output, 'w') as f:
+        json.dump(output_data, f, indent=2)
+    
+    print(f"\nFound {len(exemplars)} high-quality exemplars")
+    print(f"Results saved to {args.output}")
+    
+    # Show summary statistics
     if exemplars:
-        print(f"\nFound {len(exemplars)} high-quality exemplars.")
-        # Prepare for JSON serialization
-        output_data = [
-            {
-                "id": e.id,
-                "source_field": e.source_field,
-                "text_length": e.text_length,
-                "assessment": e.assessment,
-                "text": e.text
-            } for e in exemplars
-        ]
-        with open(args.output, 'w') as f:
-            json.dump(output_data, f, indent=2)
-        print(f"Successfully saved to {args.output}")
-    else:
-        print("\nCould not find any exemplars matching the criteria.")
+        categories = {}
+        for exemplar in exemplars:
+            cat = exemplar.assessment.get('category', 'Unknown')
+            categories[cat] = categories.get(cat, 0) + 1
+        
+        print("\nCategory distribution:")
+        for cat, count in sorted(categories.items()):
+            print(f"  {cat}: {count}")
 
-if __name__ == "__main__":
-    import re
+if __name__ == '__main__':
     main()
