@@ -1,334 +1,251 @@
-#!/usr/bin/env python3
-"""
-Comprehensive Prompt Compression Test Suite
-
-This script runs compression tests using multiple models and strategies in batches.
-It loads exemplars from the database exploration and tests compression/decompression cycles.
-"""
-
+import llm
+import sqlite3
 import json
-import subprocess
-import argparse
+import os
+from datetime import datetime
 import time
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, asdict
-import random
-import tempfile
+from tqdm import tqdm
+import re
+import numpy as np
 
-@dataclass
-class TestConfiguration:
-    """Configuration for a compression test."""
-    compression_model: str
-    decompression_model: str
-    strategy: str
-    batch_size: int = 5
+# --- CONFIGURATION ---
+DB_PATH = os.path.expanduser('~/.config/io.datasette.llm/logs.db')
+EXEMPLARS_PATH = 'high_quality_exemplars.json'
+RESULTS_PATH = 'new_comprehensive_results.json'
 
-@dataclass
-class BatchResult:
-    """Results from a batch of compression tests."""
-    config: TestConfiguration
-    results: List[Dict]
-    batch_stats: Dict
+COMPRESSION_MODELS = [
+    "claude-3.7-sonnet",
+    "gpt-4o",
+    "gpt-4o-mini"
+]
+DECOMPRESSION_MODELS = [
+    "claude-3.7-sonnet",
+    "gpt-4o",
+    "gpt-4o-mini"
+]
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-class ComprehensiveTestRunner:
-    """Runs comprehensive compression tests with multiple models and strategies."""
-    
-    def __init__(self, exemplars_file: str):
-        self.exemplars_file = exemplars_file
-        self.load_exemplars()
+# --- STATIC ONE-SHOT EXEMPLAR ---
+# This is a fixed example to guide the compression model.
+EXEMPLAR_PROMPT = "Can you write a short, informal email to my team about the new coffee machine? Mention it's a De'Longhi, it's in the main kitchen, and that the company paid for it so it's free to use. Also, remind them to clean the milk frother after use."
+EXEMPLAR_RESPONSE = "Subject: New Coffee Machine!\n\nHi Team,\n\nJust a quick note to let you know we have a brand new De'Longhi coffee machine in the main kitchen.\n\nPlease feel free to use it - it's on the house! \n\nOne small request: if you use the milk frother, please make sure to clean it out afterwards so it's ready for the next person.\n\nEnjoy!\n\nBest,"
+EXEMPLAR_COMPRESSED = {
+  "type": "email",
+  "to": "team",
+  "subject": "New coffee machine",
+  "tone": "informal",
+  "points": [
+    "what: De'Longhi coffee machine",
+    "where: main kitchen",
+    "cost: free (company expense)",
+    "action_required: clean milk frother after use"
+  ]
+}
+
+# --- HELPER FUNCTIONS ---
+
+def get_db_connection():
+    return sqlite3.connect(DB_PATH)
+
+def get_response_by_id(conn, response_id):
+    cursor = conn.cursor()
+    cursor.execute("SELECT prompt, response FROM responses WHERE id = ?", (response_id,))
+    return cursor.fetchone()
+
+def load_exemplars(path):
+    with open(path, 'r') as f:
+        return json.load(f)
+
+def clean_json_string(s):
+    s = s.strip()
+    # Handle JSON that might be embedded in markdown code blocks
+    if s.startswith("json"):
+        s = s[7:]
+    if s.endswith(""):
+        s = s[:-3]
+    s = s.strip()
+    # Find JSON objects using a simpler approach
+    # Look for balanced braces starting from the first {
+    if '{' in s:
+        start = s.find('{')
+        brace_count = 0
+        for i, char in enumerate(s[start:], start):
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    return s[start:i+1]
+    return s
+
+def calculate_token_count(text, model):
+    try:
+        return llm.get_model(model).count_tokens(text)
+    except Exception:
+        return len(text) // 4
+
+def get_embedding_score(original_prompt, original_response, decompressed_prompt, decompressed_response):
+    try:
+        embedding_model = llm.get_embedding_model(EMBEDDING_MODEL)
+        original_text = f"PROMPT:\n{original_prompt}\n\nRESPONSE:\n{original_response}"
+        decompressed_text = f"PROMPT:\n{decompressed_prompt}\n\nRESPONSE:\n{decompressed_response}"
         
-    def load_exemplars(self):
-        """Load exemplars from JSON file."""
-        with open(self.exemplars_file, 'r') as f:
-            self.exemplars = json.load(f)
-        print(f"Loaded {len(self.exemplars)} exemplars")
-    
-    def get_test_configurations(self) -> List[TestConfiguration]:
-        """Get all test configurations to run."""
-        # Multiple model combinations
-        model_pairs = [
-            ("gemini-flash", "gemini-flash"),
-            ("gemini-flash-lite", "gemini-flash-lite"),
-            ("gemini-flash", "claude-4-sonnet"),
-            ("claude-4-sonnet", "gemini-flash"),
-            ("gemini-pro", "gemini-pro"),
-        ]
-        
-        # Multiple compression strategies
-        strategies = [
-            "ultra_minimal",
-            "structured_compress", 
-            "keyword_dense",
-            "telegram_style",
-            "code_like"
-        ]
-        
-        configurations = []
-        for compression_model, decompression_model in model_pairs:
-            for strategy in strategies:
-                configurations.append(TestConfiguration(
-                    compression_model=compression_model,
-                    decompression_model=decompression_model,
-                    strategy=strategy,
-                    batch_size=5
-                ))
-        
-        return configurations
-    
-    def run_single_test(self, exemplar: Dict, config: TestConfiguration) -> Optional[Dict]:
-        """Run a single compression test."""
-        try:
-            # Step 1: Compress
-            compression_result = self.compress_text(exemplar['text'], config.strategy, config.compression_model)
-            if not compression_result:
-                return None
-            
-            # Step 2: Decompress
-            decompression_result = self.decompress_text(compression_result, config.strategy, config.decompression_model)
-            if not decompression_result:
-                return None
-            
-            # Step 3: Get embeddings and similarity
-            original_embedding = self.get_embedding(exemplar['text'])
-            decompressed_embedding = self.get_embedding(decompression_result)
-            
-            if not original_embedding or not decompressed_embedding:
-                return None
-            
-            similarity = self.cosine_similarity(original_embedding, decompressed_embedding)
-            
-            # Calculate metrics
-            original_len = len(exemplar['text'])
-            compressed_len = len(compression_result)
-            decompressed_len = len(decompression_result)
-            
-            return {
-                'exemplar_id': exemplar['id'],
-                'exemplar_category': exemplar['assessment']['category'],
-                'exemplar_density': exemplar['density_score'],
-                'original_length': original_len,
-                'compressed_length': compressed_len,
-                'decompressed_length': decompressed_len,
-                'compression_ratio': compressed_len / original_len if original_len > 0 else 0,
-                'decompression_ratio': decompressed_len / original_len if original_len > 0 else 0,
-                'similarity_score': similarity,
-                'original_text': exemplar['text'],
-                'compressed_text': compression_result,
-                'decompressed_text': decompression_result,
-                'compression_model': config.compression_model,
-                'decompression_model': config.decompression_model,
-                'strategy': config.strategy
-            }
-            
-        except Exception as e:
-            print(f"Error in single test: {e}")
-            return None
-    
-    def compress_text(self, text: str, strategy: str, model: str) -> Optional[str]:
-        """Compress text using specified strategy and model."""
-        strategies = {
-            "ultra_minimal": "Compress this text to the absolute minimum words needed while preserving ALL key information. Use abbreviations, remove redundant words, keep only essential context:",
-            "structured_compress": "Compress this text into a structured format (bullets, key-value pairs, etc.) that captures all information in minimal space:",
-            "keyword_dense": "Extract and compress this text into dense keyword clusters that preserve all meaning and relationships:",
-            "telegram_style": "Compress this text like a telegram - every word costs money, but preserve all essential information:",
-            "code_like": "Compress this text into a code-like structure (pseudo-code, structured notation) that preserves all logic and information:"
-        }
-        
-        instruction = strategies[strategy]
-        full_prompt = f"{instruction}\n\n{text}"
-        
-        try:
-            result = subprocess.run([
-                'llm', '-m', model, full_prompt
-            ], capture_output=True, text=True, check=True, timeout=180)
-            return result.stdout.strip()
-        except Exception as e:
-            print(f"Compression failed with {model}: {e}")
-            return None
-    
-    def decompress_text(self, compressed_text: str, strategy: str, model: str) -> Optional[str]:
-        """Decompress text back to expanded form."""
-        decompression_instruction = f"""
-        This is a compressed text that was created using the '{strategy}' compression strategy.
-        Please expand it back to a full, natural, detailed text that captures all the original information and intent.
-        Make it complete and well-structured, filling in natural language while preserving all the compressed information.
-        
-        Compressed text: {compressed_text}
-        """
-        
-        try:
-            result = subprocess.run([
-                'llm', '-m', model, decompression_instruction
-            ], capture_output=True, text=True, check=True, timeout=180)
-            return result.stdout.strip()
-        except Exception as e:
-            print(f"Decompression failed with {model}: {e}")
-            return None
-    
-    def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding for text."""
-        try:
-            # Use a temporary file to avoid shell argument length limits
-            with tempfile.NamedTemporaryFile(mode='w', delete=True, encoding='utf-8') as temp_f:
-                temp_f.write(text)
-                temp_f.flush() # Ensure data is written to disk before the subprocess reads it
-                
-                cmd = f'cat {temp_f.name} | llm embed -m jina-v4 2>/dev/null'
-                result = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, check=True, timeout=180)
-            
-            output_lines = result.stdout.strip().split('\n')
-            json_line = output_lines[-1]
-            embedding_data = json.loads(json_line)
-            return embedding_data
-        except Exception as e:
-            print(f"Embedding failed: {e}")
-            return None
-    
-    def cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
-        """Calculate cosine similarity between two vectors."""
-        import math
-        
-        dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
-        magnitude_a = math.sqrt(sum(a * a for a in vec_a))
-        magnitude_b = math.sqrt(sum(b * b for b in vec_b))
-        
-        if magnitude_a == 0 or magnitude_b == 0:
+        # Guard against empty text, which can cause embedding errors
+        if not original_text.strip() or not decompressed_text.strip():
             return 0.0
-            
-        return dot_product / (magnitude_a * magnitude_b)
-    
-    def run_batch(self, config: TestConfiguration, exemplars: List[Dict]) -> BatchResult:
-        """Run a batch of tests with the given configuration."""
-        print(f"\nRunning batch: {config.compression_model} -> {config.decompression_model}, strategy: {config.strategy}")
-        
-        batch_results = []
-        for i, exemplar in enumerate(exemplars):
-            print(f"  Test {i+1}/{len(exemplars)}: {exemplar['id']}")
-            result = self.run_single_test(exemplar, config)
-            if result:
-                batch_results.append(result)
-                print(f"    ✓ Compression: {result['compression_ratio']:.2f}, Similarity: {result['similarity_score']:.3f}")
-            else:
-                print(f"    ✗ Failed")
-        
-        # Calculate batch statistics
-        if batch_results:
-            batch_stats = {
-                'total_tests': len(exemplars),
-                'successful_tests': len(batch_results),
-                'success_rate': len(batch_results) / len(exemplars),
-                'avg_compression_ratio': sum(r['compression_ratio'] for r in batch_results) / len(batch_results),
-                'avg_decompression_ratio': sum(r['decompression_ratio'] for r in batch_results) / len(batch_results),
-                'avg_similarity': sum(r['similarity_score'] for r in batch_results) / len(batch_results),
-                'min_similarity': min(r['similarity_score'] for r in batch_results),
-                'max_similarity': max(r['similarity_score'] for r in batch_results),
-            }
-        else:
-            batch_stats = {
-                'total_tests': len(exemplars),
-                'successful_tests': 0,
-                'success_rate': 0.0,
-                'avg_compression_ratio': 0.0,
-                'avg_decompression_ratio': 0.0,
-                'avg_similarity': 0.0,
-                'min_similarity': 0.0,
-                'max_similarity': 0.0,
-            }
-        
-        return BatchResult(config=config, results=batch_results, batch_stats=batch_stats)
-    
-    def run_comprehensive_test(self, output_file: str = "comprehensive_results.json"):
-        """Run comprehensive test across all configurations."""
-        configurations = self.get_test_configurations()
-        print(f"Running {len(configurations)} different configurations")
-        
-        # Shuffle exemplars and select batches
-        random.shuffle(self.exemplars)
-        
-        all_batch_results = []
-        
-        for i, config in enumerate(configurations):
-            print(f"\n=== Configuration {i+1}/{len(configurations)} ===")
-            
-            # Select batch of exemplars
-            start_idx = (i * config.batch_size) % len(self.exemplars)
-            end_idx = min(start_idx + config.batch_size, len(self.exemplars))
-            batch_exemplars = self.exemplars[start_idx:end_idx]
-            
-            # If we don't have enough exemplars, wrap around
-            if len(batch_exemplars) < config.batch_size:
-                remaining = config.batch_size - len(batch_exemplars)
-                batch_exemplars.extend(self.exemplars[:remaining])
-            
-            batch_result = self.run_batch(config, batch_exemplars)
-            all_batch_results.append(batch_result)
-            
-            # Save intermediate results
-            self.save_results(all_batch_results, output_file)
-            
-            # Small delay to avoid overwhelming the APIs
-            time.sleep(2)
-        
-        # Final save and summary
-        self.save_results(all_batch_results, output_file)
-        self.print_summary(all_batch_results)
-    
-    def save_results(self, batch_results: List[BatchResult], output_file: str):
-        """Save all batch results to JSON file."""
-        output_data = {
-            'timestamp': time.time(),
-            'total_batches': len(batch_results),
-            'batch_results': []
-        }
-        
-        for batch_result in batch_results:
-            output_data['batch_results'].append({
-                'config': asdict(batch_result.config),
-                'batch_stats': batch_result.batch_stats,
-                'results': batch_result.results
-            })
-        
-        with open(output_file, 'w') as f:
-            json.dump(output_data, f, indent=2)
-        
-        print(f"Results saved to {output_file}")
-    
-    def print_summary(self, batch_results: List[BatchResult]):
-        """Print summary of all results."""
-        print("\n" + "="*60)
-        print("COMPREHENSIVE TEST SUMMARY")
-        print("="*60)
-        
-        # Group by strategy
-        by_strategy = {}
-        for batch_result in batch_results:
-            strategy = batch_result.config.strategy
-            if strategy not in by_strategy:
-                by_strategy[strategy] = []
-            by_strategy[strategy].append(batch_result)
-        
-        for strategy, batches in by_strategy.items():
-            print(f"\n{strategy.upper()}:")
-            for batch in batches:
-                config = batch.config
-                stats = batch.batch_stats
-                print(f"  {config.compression_model} -> {config.decompression_model}: "
-                      f"success={stats['success_rate']:.2f}, "
-                      f"compress={stats['avg_compression_ratio']:.2f}, "
-                      f"similarity={stats['avg_similarity']:.3f}")
+
+        original_embedding = embedding_model.embed(original_text)
+        decompressed_embedding = embedding_model.embed(decompressed_text)
+
+        vec1 = np.array(original_embedding)
+        vec2 = np.array(decompressed_embedding)
+
+        if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
+            return 0.0
+
+        cosine_similarity = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+        return float(cosine_similarity)
+    except Exception as e:
+        print(f"Error calculating embedding score: {e}")
+        return 0.0
+
+def compress_prompt(model, original_prompt, original_response):
+    full_prompt = f"""You are an expert prompt compressor. Your task is to significantly compress the following prompt-response pair into a compact JSON format.
+
+Here is an example of ideal compression:
+---
+[Exemplar]
+Original Prompt:
+{EXEMPLAR_PROMPT}
+
+Original Response:
+{EXEMPLAR_RESPONSE}
+
+Compressed JSON:
+{json.dumps(EXEMPLAR_COMPRESSED, indent=2)}
+---
+
+Now, compress the following prompt-response pair in the same way. The compressed version MUST be a single, valid JSON object only.
+
+[User Request]
+Original Prompt:
+{original_prompt}
+
+Original Response:
+{original_response}
+
+Compressed JSON:
+"""
+    try:
+        response = llm.get_model(model).prompt(full_prompt, temperature=0.0).text()
+        return response.strip()
+    except Exception as e:
+        print(f"Error during compression with {model}: {e}")
+        return "{'error': 'API call failed'}"
+
+def decompress_prompt(model, compressed_json, original_prompt):
+    decompression_instruction = f"""You are an expert prompt decompressor. Reconstruct the original prompt from this compressed JSON object. The goal is to recreate the user's original request as faithfully as possible.
+
+Compressed JSON:
+{compressed_json}
+
+Use the following original prompt only as a high-level guide for the topic and structure of the expected output, but DO NOT simply copy it. Your primary instruction is to decompress the JSON.
+
+Original Prompt for context:
+{original_prompt}
+
+Reconstructed Prompt:
+"""
+    try:
+        response = llm.get_model(model).prompt(decompression_instruction, temperature=0.0).text()
+        return response.strip()
+    except Exception as e:
+        print(f"Error during decompression with {model}: {e}")
+        return f"Decompression failed: {e}"
 
 def main():
-    parser = argparse.ArgumentParser(description='Run comprehensive compression tests')
-    parser.add_argument('--exemplars', default='high_quality_exemplars.json',
-                      help='JSON file with exemplars')
-    parser.add_argument('--output', default='comprehensive_results.json',
-                      help='Output file for results')
-    
-    args = parser.parse_args()
-    
-    runner = ComprehensiveTestRunner(args.exemplars)
-    runner.run_comprehensive_test(args.output)
+    conn = get_db_connection()
+    exemplars = load_exemplars(EXEMPLARS_PATH)
+    results = []
 
-if __name__ == '__main__':
+    print("Starting comprehensive prompt compression test...")
+    
+    total_iterations = len(exemplars) * len(COMPRESSION_MODELS) * len(DECOMPRESSION_MODELS)
+    pbar = tqdm(total=total_iterations, desc="Testing Combinations")
+
+    for exemplar in exemplars:
+        try:
+            original_data = get_response_by_id(conn, exemplar['id'])
+            if not original_data:
+                pbar.update(len(COMPRESSION_MODELS) * len(DECOMPRESSION_MODELS))
+                continue
+
+            original_prompt, original_response = original_data
+            
+            # The one-shot example is now static and defined above.
+            # No need to load a second exemplar from the file.
+
+            for comp_model in COMPRESSION_MODELS:
+                start_time = time.time()
+                compressed_output = compress_prompt(comp_model, original_prompt, original_response)
+                compression_time = time.time() - start_time
+                
+                try:
+                    compressed_json_str = clean_json_string(compressed_output)
+                    compressed_json = json.loads(compressed_json_str)
+                except json.JSONDecodeError:
+                    compressed_json = {"error": "Invalid JSON produced", "raw": compressed_output}
+
+                for decomp_model in DECOMPRESSION_MODELS:
+                    start_time = time.time()
+                    decompressed_prompt = decompress_prompt(decomp_model, json.dumps(compressed_json), original_prompt)
+                    decompression_time = time.time() - start_time
+                    
+                    decompressed_response = "NOT_TESTED"
+                    
+                    original_tokens = calculate_token_count(original_prompt, comp_model)
+                    compressed_tokens = calculate_token_count(json.dumps(compressed_json), comp_model)
+                    compression_ratio = original_tokens / compressed_tokens if compressed_tokens > 0 else 0
+                    
+                    embedding_score = get_embedding_score(
+                        original_prompt, original_response, 
+                        decompressed_prompt, decompressed_response
+                    )
+                    
+                    result_entry = {
+                        "exemplar_id": exemplar['id'],
+                        "compression_model": comp_model,
+                        "decompression_model": decomp_model,
+                        "original_prompt_tokens": original_tokens,
+                        "compressed_json_tokens": compressed_tokens,
+                        "compression_ratio": compression_ratio,
+                        "embedding_similarity": embedding_score,
+                        "compression_time_s": compression_time,
+                        "decompression_time_s": decompression_time,
+                        "compressed_json": compressed_json
+                    }
+                    results.append(result_entry)
+                    pbar.update(1)
+
+        except Exception as e:
+            print(f"\nError processing exemplar {exemplar.get('id', 'N/A')}: {e}")
+            pbar.update(len(COMPRESSION_MODELS) * len(DECOMPRESSION_MODELS))
+
+    pbar.close()
+    conn.close()
+
+    with open(RESULTS_PATH, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nComprehensive test finished. Results saved to {RESULTS_PATH}")
+    
+    if results:
+        best_ratio = max([r for r in results if r['compression_ratio'] is not None], key=lambda x: x['compression_ratio'], default=None)
+        best_similarity = max([r for r in results if r['embedding_similarity'] is not None], key=lambda x: x['embedding_similarity'], default=None)
+        if best_ratio:
+            print(f"\nBest Compression Ratio: {best_ratio['compression_ratio']:.2f} (by {best_ratio['compression_model']})")
+        if best_similarity:
+            print(f"Best Embedding Similarity: {best_similarity['embedding_similarity']:.4f} (decompress by {best_similarity['decompression_model']})")
+
+if __name__ == "__main__":
     main()
