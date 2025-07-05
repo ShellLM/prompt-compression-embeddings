@@ -22,3 +22,4 @@ __pycache__/
 
 # Agent-specific files, logs, and temporary outputs
 .agent/
+.agent/
